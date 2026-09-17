@@ -177,6 +177,31 @@ def test_transcript_bearing_log_lines_are_dropped_whole():
         "turn traces quote transcripts verbatim and must not be sanitised in place"
 
 
+def test_announce_request_lines_survive_with_the_text_redacted():
+    """
+    The AnnounceRequest line is the only record that an announcement arrived
+    and the only place `start_conversation` is logged, so dropping it hides
+    the difference between a plain announce and `ask_question`. Its `text=`
+    is a TTS string HA sent us, quoted by repr, so the quoted-string rule
+    already covers it: keep the line, lose the payload. Reported in #507
+    after a bundle showed announcement audio playing with no announcement
+    ever received, which is not a state the code can reach.
+    """
+    out = "\n".join(S.sanitise_log([
+        "[Kitchen] AnnounceRequest: media_id='http://10.10.1.81:8123/api/tts_proxy/a.mp3' "
+        "text='Dinner is ready' start_conversation=True",
+        # The turn trace is the transcript-bearing line the marker existed
+        # for; it must still go whole, apostrophes and all.
+        "[TURN] trigger=wakeword outcome=ok text=\"what's the weather\" tts_bytes=1",
+    ]))
+    assert "AnnounceRequest" in out
+    assert "start_conversation=True" in out
+    assert "media_id=<redacted>" in out
+    assert "text=<redacted>" in out
+    assert "Dinner" not in out and "ready" not in out
+    assert "[TURN]" not in out and "weather" not in out
+
+
 def test_live_stats_are_allowlisted_not_passed_through():
     """
     Regression: live.stats was handed over as a whole dict and leaked
