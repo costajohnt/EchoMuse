@@ -2893,6 +2893,37 @@ const _SECURITY_LABEL = {
 const _MAGISK_FILENAME = 'Magisk-v17.3.zip';
 const _MAGISK_SHA256    = '18e46b16b25ebe691c282fe311beccd4811cd533848a64e2efbd754fb85efde7';
 
+// Is this an EchoMuse server binary? Checked before the install step pushes
+// anything, because nothing after it would notice: the step verifies the copy
+// by SIZE, so a wrong file installs cleanly, logs "EchoMuse installed", and
+// the device then boots without a server that can register — out of reach of
+// OTA too. Found 2026-09-18 when the escrowed boot image was picked as the
+// custom build on VVV.
+//
+// Two tests: a 32-bit ARM ELF (the header's class byte and e_machine 0x28),
+// and our own module path, which Go compiles in hundreds of times (352 in a
+// v2.15.0-37 build, 335 in the v2.15.0 release, 0 in a boot image). It
+// cannot say the binary will LOAD on this device — that needs running it,
+// and the server has no mode that does only that.
+function _serverBinaryVerdict(bytes) {
+  const u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (u8.length < 52 || u8[0] !== 0x7f || u8[1] !== 0x45 || u8[2] !== 0x4c || u8[3] !== 0x46) {
+    const head = new TextDecoder('latin1').decode(u8.slice(0, 8)).replace(/[^\x20-\x7e]/g, '.');
+    return { ok: false, reason: `That file is not a program at all (it starts "${head}"). `
+      + 'Choose the EchoMuse server binary.' };
+  }
+  const machine = u8[18] | (u8[19] << 8);
+  if (u8[4] !== 1 || machine !== 0x28) {
+    return { ok: false, reason: 'That is a program, but not a 32-bit ARM one, so it cannot run '
+      + 'on an Echo. Choose the EchoMuse server binary built for the device.' };
+  }
+  if (!new TextDecoder('latin1').decode(u8).includes('github.com/wilbowes/EchoMuse/')) {
+    return { ok: false, reason: 'That is an ARM program, but not an EchoMuse server. '
+      + 'Choose the EchoMuse server binary.' };
+  }
+  return { ok: true, reason: '' };
+}
+
 async function _sha256Hex(buf) {
   const digest = await crypto.subtle.digest('SHA-256', buf);
   return Array.from(new Uint8Array(digest)).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -3410,6 +3441,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // longer has one — a page reload loses emosRef, which is exactly when the
   // restore is needed. See restoreEscrowedBoot.
   const [restoreFile, setRestoreFile] = useState(null);
+  // A successful restore ENDS the run. It undoes the partition write every
+  // later step depends on, and the wizard cannot step backwards, so carrying
+  // on would provision on top of a stock boot image (tested 2026-09-18: a
+  // FireOS run restored at Magisk sat on step 4 as if Patch Boot had held).
+  const [restored, setRestored] = useState(false);
   // The serial read at step 1. Step 9 needs it to ask whether THIS
   // device has connected, rather than inferring it from the device list
   // having grown.
@@ -3683,19 +3719,27 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       + '    [ -z "$S" ] && [ -e "$d/$n" ] && S=$(readlink -f "$d/$n"); done; done; '
       + 'echo "NODE=$S"; '
       + '[ -z "$S" ] && exit 0; '
-      + 'WAS=$(mount | grep " /system " ); '
-      + '[ -z "$WAS" ] && mount -o ro "$S" /system 2>&1; '
+      // Mounted on a PRIVATE directory, never on /system. TWRP 3.7 (amonet v2)
+      // makes /system a symlink to /system_root/system, which does not exist
+      // until system_root is mounted, so `mount ... /system` failed with "No
+      // such file or directory" and the read found nothing — measured on the
+      // spare 2026-09-17. It still printed the sentinel, so every v2 device
+      // read as "build unknown" and the release and board checks skipped. If
+      // the partition is already mounted somewhere, read it there.
+      + 'M=$(mount | sed -n "s|^$S on \\([^ ]*\\) .*|\\1|p" | sed -n 1p); OWN=""; '
+      + 'if [ -z "$M" ]; then M=/tmp/em_sysread; mkdir -p "$M"; OWN=1; '
+      + '  mount -o ro "$S" "$M" 2>&1 || echo "MOUNTFAIL"; fi; '
+      + 'echo "MNT=$M"; '
       // FireOS 6 is system-as-root: the tree sits in a /system directory
-      // INSIDE the partition, so mounting system_<slot> at /system puts the
-      // file at /system/system/build.prop. FireOS 5 keeps it at the root.
-      // Prefer the nested one where it exists — emOS's init resolves the same
-      // layout the same way (emos/init/init.c).
-      + 'B=/system/build.prop; '
-      + '[ -f /system/system/build.prop ] && B=/system/system/build.prop; '
+      // INSIDE the partition, so the file is at <mount>/system/build.prop.
+      // FireOS 5 keeps it at the root. Prefer the nested one where it exists —
+      // emOS's init resolves the same layout the same way (emos/init/init.c).
+      + 'B="$M/build.prop"; '
+      + '[ -f "$M/system/build.prop" ] && B="$M/system/build.prop"; '
       + 'echo "PROP=$B"; '
       + 'grep -E "^ro\\.(build\\.version\\.(name|incremental|release)|product\\.(model|name))=" '
       + '  "$B" 2>/dev/null; '
-      + '[ -z "$WAS" ] && umount /system 2>/dev/null; '
+      + '[ -n "$OWN" ] && { umount "$M" 2>/dev/null; rmdir "$M" 2>/dev/null; }; '
       + 'echo _SYSREAD_OK');
   }
 
@@ -3704,6 +3748,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     if (!out.includes('_SYSREAD_OK')) return null;
     const pick = k => ((out.match(new RegExp('^' + k + '=(.+)$', 'm')) || [])[1] || '').trim();
     const build = pick('ro\\.build\\.version\\.incremental');
+    if (!build) {
+      // Say what the read saw, so a transcript names the cause instead of
+      // "unknown" — the failure this replaced looked like a quirk of one unit.
+      addLog('  /system read: ' + out.split('\n')
+        .filter(l => /^(NODE|MNT|PROP)=|MOUNTFAIL|mount:/.test(l)).join(' | '), 'warn');
+    }
     return build ? {
       build,
       name:  pick('ro\\.build\\.version\\.name'),
@@ -3878,7 +3928,12 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     // device object, and it IS ro.serialno (set at registration time in
     // em_controller.py), not a separate serial/serial_number/id field.
     if (serial && knownDevices && knownDevices.length) {
-      const match = knownDevices.find(d => d.device_id && d.device_id.includes(serial));
+      // A row with no firmware_ver has never registered: ensure_device_token
+      // creates one when the TLS token is minted, before first contact, so a
+      // run that stopped after that step left a row the device never used.
+      // Refusing on it cost a delete-and-retry on every bench run 2026-09-18.
+      const match = knownDevices.find(d => d.device_id && d.device_id.includes(serial)
+                                        && d.firmware_ver);
       if (match) {
         // Close the live ADB session before throwing — otherwise the
         // transport stays open and _lastUsbDevice keeps pointing at it.
@@ -3990,6 +4045,53 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // able to read by-name is not evidence of danger, and refusing on it would
   // block any device whose TWRP lays that directory out differently — the same
   // reading the OTA free-space check applies to an unreadable df.
+  // Android boot image v0-v2 stores a 512-byte, NUL-terminated cmdline at
+  // bytes 64..575. The wizard only owns the SELinux argument: replace an
+  // existing enforce token in place, or append permissive if absent, keeping
+  // every other argument and all bytes outside the field untouched.
+  function patchBootCmdline(bootImg) {
+    // Keep the field bounds and terminator rules aligned with em_emos_build.pack
+    // and emos/mkboot.py (whose byte-for-byte parity is tested by test_agrees_with_mkboot).
+    // This wizard additionally replaces enforce: the first occurrence wins.
+    const fieldStart = 64;
+    const fieldEnd = 576;
+    if (!bootImg || bootImg.length < fieldEnd) {
+      throw new Error(
+        `Boot image is too short for its cmdline field (${bootImg?.length || 0} bytes).`);
+    }
+
+    const field = bootImg.slice(fieldStart, fieldEnd);
+    const used = field.indexOf(0);
+    if (used < 0) throw new Error('Boot cmdline has no NUL terminator in its field.');
+    // Map each byte to one character so unrelated, even non-UTF-8, bytes are
+    // copied exactly rather than replaced by the text decoder.
+    const existing = String.fromCharCode(...field.slice(0, used));
+    const argument = 'androidboot.selinux=permissive';
+    let found = false;
+    let cmdline = existing.replace(/(^|[ \t\r\n\v\f])androidboot\.selinux=([^ \t\r\n\v\f]*)/g,
+      (token, space, value) => {
+        if (value !== 'enforce' && value !== 'permissive') {
+          throw new Error('Boot cmdline already specifies a conflicting androidboot.selinux value.');
+        }
+        found = true;
+        return space + argument;
+      });
+    if (!found) {
+      const needsSpace = used > 0 && !/[ \t\r\n\v\f]/.test(existing.at(-1));
+      cmdline += `${needsSpace ? ' ' : ''}${argument}`;
+    }
+    // Keep one byte for the terminator; never truncate a FireOS argument.
+    if (cmdline.length >= field.length) {
+      throw new Error(
+        `Boot cmdline is too long to set ${argument} without truncating FireOS arguments.`);
+    }
+
+    const patched = new Uint8Array(bootImg);
+    patched.set(Uint8Array.from(cmdline, char => char.charCodeAt(0)), fieldStart);
+    patched[fieldStart + cmdline.length] = 0;
+    return patched;
+  }
+
   // Two unlock generations put the boot partition in two different places.
   //
   // amonet v1 INVERTS the by-name map under TWRP: the bare boot_a points at
@@ -4013,8 +4115,9 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // ── Which slot holds stock, and which one emOS goes in ───────────────────
   //
   // An emOS install is a PAIR: the stock boot image we built from, and the
-  // FireOS userspace it was read beside. Which boot slot emOS physically
-  // occupies is just storage — the bootloader is pointed at it afterwards.
+  // FireOS userspace it was read beside. Which slot emOS occupies is NOT a
+  // free choice on amonet v2: its bootloader only ever starts boot_a (#544,
+  // see chooseBootSlots).
   //
   // So the stock boot image is never overwritten. It is the build reference,
   // it is the only way back to FireOS, and it is the only way to rebuild an
@@ -4044,16 +4147,20 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
 
   // The decision, pure so it can be tested without a device.
   //
-  // `suffix` is ro.boot.slot_suffix — the slot the device BOOTED FROM. It is
-  // used only to break the both-stock tie, never to choose where to write: it
-  // says nothing about boot-next, which lives in the BCB.
+  // **amonet v2's bootloader on biscuit starts boot_a whatever the BCB says**
+  // (#544). The BCB only changes androidboot.slot_suffix: measured on the
+  // spare 2026-09-17, BCB B-active booted the emOS image in boot_a with
+  // `slot_suffix=_b`, and the reporter's B-active boot ran the stock image in
+  // boot_a while a marker stamped into boot_b never appeared. So emOS always
+  // goes in slot A, and the stock image is KEPT in slot B — copied there from
+  // A first when A holds the only one.
+  //
+  // `suffix` (ro.boot.slot_suffix) is therefore no guide to what is running,
+  // and is not used to choose anything.
   function chooseBootSlots(slots, suffix) {
-    const other = (s) => (s === 'a' ? 'b' : 'a');
-    const stock = ['a', 'b'].filter(s => slots[s].state === 'stock');
-    const booted = /^_([ab])$/.test(suffix || '') ? suffix.slice(1) : '';
-
-    if (!stock.length) {
-      const both = ['a', 'b'].every(s => slots[s].state === 'ours');
+    const st = (s) => slots[s].state;
+    if (st('a') !== 'stock' && st('b') !== 'stock') {
+      const both = st('a') === 'ours' && st('b') === 'ours';
       return { ok: false, reason: both
         ? 'Both boot slots already hold emOS, so there is no stock FireOS boot '
           + 'image on this device to build from or fall back to. Restore your '
@@ -4062,20 +4169,23 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
           + 'nothing to build an emOS image from. Nothing has been read or '
           + 'written.' };
     }
-
-    // Both stock: keep the one the device boots today and take the other, so
-    // the image the user is running is the one preserved.
-    const donor = stock.length === 2 ? (booted || 'a') : stock[0];
-    const target = other(donor);
-
-    if (slots[target].state === 'stock' && stock.length !== 2) {
-      return { ok: false, reason: 'Internal error choosing boot slots.' };
-    }
-    if (!slots[target].dev) {
+    if (!slots.a.dev) {
       return { ok: false, reason:
-        `Slot ${target.toUpperCase()} is where emOS would go, but `
-        + `/dev/block/by-name/boot_${target} did not resolve to a block device. `
-        + 'Nothing has been read or written.' };
+        'Slot A is where emOS has to go — it is the only slot this bootloader '
+        + 'starts — but /dev/block/by-name/boot_a did not resolve to a block '
+        + 'device. Nothing has been read or written.' };
+    }
+
+    // Stock in A: build from it, and make sure B keeps a copy before A is
+    // overwritten. Stock only in B: build from B, which stays as it is.
+    const donor = st('a') === 'stock' ? 'a' : 'b';
+    const preserve = donor === 'a' && st('b') !== 'stock';
+    if (preserve && !slots.b.dev) {
+      return { ok: false, reason:
+        'Slot A holds the only stock FireOS boot image and emOS has to replace '
+        + 'it, but there is no slot B to keep a copy in '
+        + '(/dev/block/by-name/boot_b did not resolve). Nothing has been read '
+        + 'or written.' };
     }
 
     // The system partition PAIRED with the donor — stamped into the image so
@@ -4090,11 +4200,17 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + 'cannot be built without knowing which one it is.' };
     }
 
-    return { ok: true, donor, target,
-             donorDev: slots[donor].dev, targetDev: slots[target].dev,
+    const kept = preserve
+      ? `stock FireOS is copied to slot B and kept there (slot B holds ${st('b')} today)`
+      : donor === 'a'
+        ? 'slot B already holds a stock FireOS image and keeps it'
+        : 'stock FireOS stays in slot B';
+    return { ok: true, donor, target: 'a',
+             donorDev: slots[donor].dev, targetDev: slots.a.dev,
+             preserveDev: preserve ? slots.b.dev : '',
              systemPart: Number(sysPart),
-             reason: `stock FireOS stays in slot ${donor.toUpperCase()}; emOS goes `
-                   + `in slot ${target.toUpperCase()}, built against system_${donor} `
+             reason: `emOS goes in slot A, the slot this bootloader starts; ${kept}; `
+                   + `built from slot ${donor.toUpperCase()} against system_${donor} `
                    + `(p${sysPart})` };
   }
 
@@ -4253,28 +4369,35 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + `so nothing is being patched or flashed.`);
     }
 
-    // Check the CURRENT cmdline before touching anything — magiskboot's
-    // own unpack log already echoes CMDLINE [...] for the unmodified
-    // image, so use that as the source of truth instead of re-deriving
-    // it from the manual byte-offset patch logic. If a previous wizard
-    // run already flipped SELinux to permissive, re-running the blind
-    // overwrite is unnecessary risk (another write to a device with no
-    // real recovery path if it goes wrong) for zero benefit.
+    // Escrow before anything writes (#468). The emOS flow has always handed the
+    // operator the original; this flow pulled the same bytes into the page and
+    // kept them only in /tmp/work, which is gone after the first reboot — the
+    // moment someone finds they need it. Here rather than as a step of its own
+    // because the image is already in hand, and a new step renumbers every
+    // index this flow hardcodes. emosRef/emosTarget are the restore's inputs in
+    // both flows.
+    const md5 = await _md5Hex(bootImg);
+    setEmosRef({ bytes: bootImg, md5, target: boot.target });
+    setEmosTarget(boot.target);
+    _downloadBytes(bootImg, `echomuse-boot-before-patch-${md5.slice(0, 8)}.img`);
+    addLog(`Escrowed ${boot.target} as it is now, md5 ${md5}. A copy has been downloaded `
+         + 'to your computer. KEEP IT — from TWRP it puts this partition back as it was.', 'warn');
+
+    // Validate and transform the actual field even when magiskboot's log
+    // contains "permissive": it may be a substring or follow an enforce token.
+    // Only skip the write if the bounded patch leaves the image unchanged.
+    const patched = patchBootCmdline(bootImg);
+    const cmdlineAlreadyPermissive = patched.every((byte, i) => byte === bootImg[i]);
+    // Unpack the current image for its ramdisk; the log remains diagnostic.
     addLog('Checking current boot image cmdline…');
     const probeOut = await c.shell('cd /tmp/work && /tmp/bin/magiskboot unpack boot.img 2>&1');
     addLog(probeOut || '(done)');
-    const cmdlineAlreadyPermissive = probeOut.includes('androidboot.selinux=permissive');
 
     let workImg = 'boot.img';
     if (cmdlineAlreadyPermissive) {
       addLog('cmdline already has androidboot.selinux=permissive — skipping cmdline patch.', 'warn');
     } else {
       addLog('Patching cmdline for SELinux permissive…');
-      const patched = new Uint8Array(bootImg);
-      const newCmd  = new TextEncoder().encode('bootopt=64S3,32N2,64N2 androidboot.selinux=permissive');
-      patched.fill(0, 64, 576);
-      patched.set(newCmd, 64);
-
       addLog('Pushing patched image…');
       await c.push('/tmp/work/boot_patched.img', patched, pct => setProgress({ label: 'Pushing boot image', pct }));
       setProgress(null);
@@ -5311,6 +5434,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       addLog(`Pushing ${file.name} to /sdcard/server_new…`);
       buf = await file.arrayBuffer();
     }
+    const verdict = _serverBinaryVerdict(buf);
+    if (!verdict.ok) throw new Error(`${verdict.reason} Nothing has been installed.`);
     await c.push('/sdcard/server_new', new Uint8Array(buf),
       pct => setProgress({ label: 'Uploading binary', pct }));
     setProgress(null);
@@ -5768,8 +5893,11 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       addLog('  amonet unlock confirmed in the partition map', 'ok');
     }
 
-    addLog(`Reading ${boot.target} off the device (10–20s)…`);
-    const ddOut = await c.shell(`dd if=${boot.target} of=/tmp/emos_ref.img bs=1048576 2>&1`);
+    // The escrow is the STOCK image — the build input and the undo. On v2 that
+    // is the donor slot, which is not necessarily the one LK reports booting.
+    const refDev = plan ? plan.donorDev : boot.target;
+    addLog(`Reading ${refDev} off the device (10–20s)…`);
+    const ddOut = await c.shell(`dd if=${refDev} of=/tmp/emos_ref.img bs=1048576 2>&1`);
     addLog(ddOut.trim() || '(done)');
     const ref = await c.pull('/tmp/emos_ref.img');
     await c.shell('rm -f /tmp/emos_ref.img');
@@ -5777,13 +5905,13 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const magic = new TextDecoder().decode(ref.slice(0, 8));
     if (magic !== 'ANDROID!') {
       throw new Error(
-        `Read ${ref.length} bytes from ${boot.target} and it does not start with `
+        `Read ${ref.length} bytes from ${refDev} and it does not start with `
         + `"ANDROID!" (got "${magic.replace(/[^\x20-\x7e]/g, '.')}"). That is not a boot `
         + `image, so nothing is being escrowed or flashed.`);
     }
     const md5 = await _md5Hex(ref);
     addLog(`Escrowed ${(ref.length / 1024 / 1024).toFixed(1)} MB, md5 ${md5}`, 'ok');
-    setEmosRef({ bytes: ref, md5, target: boot.target });
+    setEmosRef({ bytes: ref, md5, target: refDev });
 
     // Handed to the operator as a file as well as held in the page. The copy
     // in the browser is the convenient one; the one on their disk is the one
@@ -6212,6 +6340,30 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
         + 'problem, not a device one. Re-run Build emOS.');
     }
 
+    // Keep the stock image before slot A is overwritten (#544): emOS has to
+    // go in A, and when A holds the only stock image it is copied to B first,
+    // through the same verified write. B held nothing worth keeping, and A is
+    // not touched unless the copy verified.
+    if (emosPlan && emosPlan.ok && emosPlan.preserveDev) {
+      if (!emosRef || emosRef.target !== emosPlan.donorDev) {
+        throw new Error('The escrowed image is not the one from slot A, so it cannot be '
+          + 'copied to slot B. Nothing has been written. Re-run the escrow step.');
+      }
+      let perr = await _writeBootPartition(
+        c, emosPlan.preserveDev, emosRef.bytes, emosRef.md5, 'stock image (copy to slot B)');
+      if (perr) {
+        addLog(`${perr}`, 'error');
+        addLog('Retrying the copy once…', 'warn');
+        perr = await _writeBootPartition(
+          c, emosPlan.preserveDev, emosRef.bytes, emosRef.md5, 'stock image (copy to slot B, retry)');
+      }
+      if (perr) {
+        throw new Error(`${perr}\n\nSlot A has NOT been touched and still boots stock FireOS. `
+          + 'Slot B held no stock image before this, so nothing was lost.');
+      }
+      addLog('Stock FireOS is now kept in slot B.', 'ok');
+    }
+
     let err = await _writeBootPartition(
       c, target, emosImage.bytes, emosImage.md5, 'emOS image');
     if (err) {
@@ -6281,7 +6433,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       }
       if (!bytes) {
         throw new Error('No escrowed image in this session. Choose the '
-          + 'echomuse-stock-boot-*.img file downloaded at the escrow step.');
+          + 'echomuse-*.img file downloaded at the escrow step.');
       }
       // The same guard the escrow and the patch step apply. Restoring is the
       // one operation nobody will check afterwards, so a file that is not a
@@ -6307,6 +6459,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
       addLog('Escrowed image restored and verified against the partition. The '
            + 'device will boot exactly as it did before this run. Everything '
            + 'installed on /data is untouched.', 'ok');
+      setRestored(true);
     } catch (e) {
       addLog(`Restore failed: ${e.message}`, 'error');
     } finally {
@@ -6396,15 +6549,27 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
   // unexplained failure when someone types a name from memory.
   async function scanWifiConsole(con) {
     if (!con) throw new Error('No serial console — re-run the Reboot and Watch step.');
-    const started = await con.run('wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan');
-    if (!/OK/.test(started)) {
+    const wpa = 'wpa_cli -p /data/misc/wifi/sockets -i wlan0';
+    // Early in the boot the supplicant is not answering yet, so wait for it
+    // rather than fail a click the operator could not have known was early.
+    for (let i = 0; i < 20 && !/PONG/.test(await con.run(`${wpa} ping`)); i++) {
+      if (i === 0) addLog('Waiting for the WiFi radio to come up…');
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    const started = await con.run(`${wpa} scan`);
+    // FAIL-BUSY is a scan ALREADY running — typically the supplicant looking
+    // for a saved network by itself — not a failure: its results are as good
+    // as ours. Seen on the spare 2026-09-18, where the first click failed and
+    // the second worked.
+    if (/FAIL-BUSY/.test(started)) {
+      addLog('A scan is already running — using its results.');
+    } else if (!/OK/.test(started)) {
       throw new Error(`wpa_cli would not start a scan (said "${started.trim() || 'nothing'}").`);
     }
     // A scan takes a few seconds; asking too early returns the previous
     // results or none at all.
     await new Promise(r => setTimeout(r, 4000));
-    const raw = await con.run(
-      'wpa_cli -p /data/misc/wifi/sockets -i wlan0 scan_results', 20000);
+    const raw = await con.run(`${wpa} scan_results`, 20000);
     const nets = parseScanResults(raw);
     if (!nets.length) {
       addLog('The scan returned no networks. The radio is up — try again, or '
@@ -6786,7 +6951,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     const alreadyThere = isEmos && step === 1 && adb
                       && _bannerMode(adb.banner) === 'twrp';
     if ((!autoSteps.has(step) && !alreadyThere)
-        || running || stepState[step] !== 'pending') return;
+        || running || restored || stepState[step] !== 'pending') return;
     // The emOS build's default source is the release, so the auto path has to
     // say so — `useLatest` is undefined otherwise and it would ask for a file
     // nobody has chosen.
@@ -6798,7 +6963,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
     addLog(`"${STEPS[step].label}" needs an ADB connection and there isn't one — `
          + `the previous step disconnected the device. Reconnect and click Retry.`, 'error');
     markStep(step, 'error');
-  }, [step, running, adb]);
+  }, [step, running, adb, restored]);
 
   const cur    = STEPS[step];
   const isDone = step === STEPS.length - 1 && stepState[step] === 'done';
@@ -6904,6 +7069,18 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
               <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--text2)', lineHeight: 1.6 }}>{cur.desc}</div>
             </div>
 
+            {/* After a restore the run is over: every step control is hidden
+                and this is all that is offered. See `restored`. */}
+            {restored && (
+              <div style={{ margin: '6px 0 10px', display: 'flex', flexDirection: 'column', gap: 10 }}>
+                <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 11, color: 'var(--ok)', lineHeight: 1.7 }}>
+                  Device restored. Reboot it from TWRP (Reboot → System), then start the wizard again.
+                </div>
+                <div><Pill accent onClick={onClose}>Close</Pill></div>
+              </div>
+            )}
+
+            {!restored && (<>
             {/* WebUSB pre-flight. Shown on step 0 rather than at the first
                 click, because the point is to be read before a device is
                 unboxed — the throw in requestDevice says the same thing to
@@ -7107,7 +7284,10 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 operator has nothing else to try. It needs ADB, so it is only
                 useful while the device is still in TWRP; that is exactly the
                 state both failures leave it in. */}
-            {isEmos && (step === 6 || step === 7)
+            {/* FireOS: steps 2-4, the TWRP steps after its escrow (#468). Magisk
+                at step 3 rewrites the boot partition too, so the restore undoes
+                both. Not offered once Android is up — no TWRP, no restore. */}
+            {(isEmos ? (step === 6 || step === 7) : (step >= 2 && step <= 4))
               && stepState[step] === 'error' && !running && (
               <div className="em-inset" style={{ marginBottom: 12, display: 'flex', flexDirection: 'column', gap: 8, padding: 10 }}>
                 <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--text2)' }}>
@@ -7118,7 +7298,7 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 {!emosRef && (
                   <div style={{ fontFamily: "'DM Mono',monospace", fontSize: 10, color: 'var(--warn)' }}>
                     This session has no escrowed image — choose the
-                    echomuse-stock-boot-*.img downloaded at step 3.
+                    {isEmos ? ' echomuse-stock-boot-*.img' : ' echomuse-boot-before-patch-*.img'} downloaded at step 3.
                   </div>
                 )}
                 <input type="file" accept=".img"
@@ -7245,6 +7425,8 @@ function ProvisionWizard({ token, onClose, knownDevices }) {
                 </div>
               </div>
             )}
+
+            </>)}
 
             {/* Progress bar — accent slate, same as toggles/sliders */}
             {progress && (
