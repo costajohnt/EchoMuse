@@ -139,11 +139,24 @@ _COUNTER_FIELDS = (
 # trace, but it also matched the AnnounceRequest line, whose `text=` is a TTS
 # string HA sent us rather than speech, and which is the only record that an
 # announcement arrived at all (#507). That line falls through to _QUOTED.
-_LOG_DROP = ("STT result", "[TURN]", "Utterance saved", "stt_text")
+_LOG_DROP = (
+    "STT result",
+    "[TURN]",
+    "Utterance saved",
+    "stt_text",
+    "Spoken dismissal",
+)
 
 # Quoted strings and URLs. Turn traces quote transcripts; media URLs carry
-# provider paths and session tokens.
-_QUOTED = re.compile(r"""(['"])(?:(?!\1).)*\1""")
+# provider paths and session tokens. Log lines quote values by repr, so a
+# quote inside the string arrives escaped: the first two forms skip `\.`
+# pairs so `'it\'s "late"'` redacts whole instead of leaking the tail. The
+# plain forms are the fallback for text that is not repr (device shell
+# output, exception text via _scrub), where a value ending in a backslash
+# would otherwise never close.
+_QUOTED = re.compile(
+    r"'(?:[^'\\]|\\.)*'" r'|"(?:[^"\\]|\\.)*"' r"|'[^']*'" r'|"[^"]*"'
+)
 _URL = re.compile(r"""https?://[^\s'"]+""")
 
 # Bare network identifiers in log prose — "Device connected: ... at 10.10.1.60"

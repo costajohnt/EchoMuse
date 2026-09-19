@@ -202,6 +202,34 @@ def test_announce_request_lines_survive_with_the_text_redacted():
     assert "[TURN]" not in out and "weather" not in out
 
 
+def test_announce_text_with_mixed_quotes_redacts_whole():
+    """
+    Announcement text is written by the user in their automations, so a
+    partial redaction is a leak. repr escapes an inner quote of the same
+    kind, and the quoted-string rule has to honour that escape instead of
+    ending the match at it.
+    """
+    line = (
+        "[Kitchen] AnnounceRequest: text=" + repr("it's \"late\"")
+        + " start_conversation=False"
+    )
+    out = "\n".join(S.sanitise_log([line]))
+    assert out.split("text=")[1] == "<redacted> start_conversation=False"
+
+
+def test_spoken_dismissal_lines_are_dropped():
+    """
+    The spoken-dismissal line logs the STT transcript by repr. Transcript
+    lines go whole, not redacted, like the other speech markers.
+    """
+    out = "\n".join(S.sanitise_log([
+        "[Kitchen] Spoken dismissal 'stop the alarm' — stopping alarm locally",
+        "[Kitchen] Device connected: ABC v=v2.9.13",
+    ]))
+    assert "Spoken dismissal" not in out and "stop" not in out
+    assert "Device connected" in out
+
+
 def test_live_stats_are_allowlisted_not_passed_through():
     """
     Regression: live.stats was handed over as a whole dict and leaked
