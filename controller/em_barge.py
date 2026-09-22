@@ -115,3 +115,21 @@ def decide(*,
         return BargeDecision(True, f"score={score:.3f} >= {wake_threshold:.2f}")
     return BargeDecision(False, "")
 
+
+
+def stand_down_reason(*, serves: bool, won_by: str, device_id: str) -> str | None:
+    """
+    Why a barge-in that fired will not become this device's turn, or None if
+    it will.
+
+    The two reasons are handled differently, the same way the wake path
+    handles them. "no_ha" is the device's own state (nothing behind it to run
+    a turn), so it gets a row in the activity history and the ring cue.
+    "arbitration" is a race another Echo won, which the user has no interest
+    in, so it is only logged.
+    """
+    if not serves:
+        return "no_ha"
+    if won_by != device_id:
+        return "arbitration"
+    return None

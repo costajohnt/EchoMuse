@@ -112,3 +112,48 @@ def test_a_decision_that_did_not_fire_carries_no_reason():
     """So a caller cannot log a justification for something that never fired."""
     assert playback(0.9, prev=0.0).note == ""
     assert thinking(0.0).note == ""
+
+
+# ── Standing down after a fired barge ─────────────────────────────────────────
+
+def test_stand_down_no_ha_wins_over_arbitration():
+    """
+    No pipeline is the device's own state, and it is what earns the trace and
+    the cue; a device with no HA never claims, so won_by is still itself.
+    """
+    assert em_barge.stand_down_reason(serves=False, won_by="a", device_id="a") == "no_ha"
+
+
+def test_stand_down_arbitration_loss():
+    assert em_barge.stand_down_reason(serves=True, won_by="b", device_id="a") == "arbitration"
+
+
+def test_barge_that_wins_does_not_stand_down():
+    assert em_barge.stand_down_reason(serves=True, won_by="a", device_id="a") is None
+
+
+def _controller_code() -> str:
+    """em_controller.py with comments and docstrings removed, so the guard
+    below matches code rather than the prose describing it."""
+    import re
+    src = (pathlib.Path(__file__).resolve().parents[1] / "em_controller.py").read_text()
+    src = re.sub(r'"""(?:.|\n)*?"""', "", src)
+    return "\n".join(re.sub(r"#.*$", "", line) for line in src.splitlines())
+
+
+def test_no_ha_stand_down_cues_after_the_barge_flags_clear():
+    """
+    The cue is skipped while barge_detected is set, and the interrupted turn
+    overwrites the outcome during its own cleanup. So the ceded branch has to
+    clear the flags first and record the dropped barge itself; moving either
+    call above the resets silently loses the cue again.
+    """
+    import re
+    code = _controller_code()
+    branch = code[code.index("if device.barge_detected and device.barge_ceded:"):]
+    branch = branch[:branch.index("break")]
+    cleared = re.search(r"device\.barge_detected\s*=\s*False", branch).start()
+    assert cleared < branch.index("record_dropped_wake(")
+    assert cleared < branch.index("_leds_turn_end(device)")
+    # Not "wakeword": _persist_turn's shadow comparison keys on that prefix.
+    assert 'f"barge-in(' in branch

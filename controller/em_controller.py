@@ -617,6 +617,9 @@ class Device:
         # barge_ceded says this device must not run the interrupting turn.
         # Folding them into one flag is how both devices answered.
         self.barge_ceded      = False
+        # Set with barge_ceded when the reason was no HA rather than a lost
+        # race: the turn loop gives that case the wake path's trace and cue.
+        self.barge_no_ha      = False
 
         # Recent voice-turn traces (dicts derived from TurnTrace at emit
         # time in em_esphome) — powers the Status tab's observability panel.
@@ -1755,7 +1758,10 @@ async def _barge_watcher(device: Device, playback_started: asyncio.Event):
                             heard_at=heard,
                             slack_s=_arbitration_slack(),
                         )
-                    device.barge_ceded = (not serves) or won_by != device.device_id
+                    reason = em_barge.stand_down_reason(
+                        serves=serves, won_by=won_by, device_id=device.device_id)
+                    device.barge_ceded = reason is not None
+                    device.barge_no_ha = reason == "no_ha"
                     if device.barge_ceded:
                         log.info(
                             f"[{device.device_id}] Barge-in ceded to "
@@ -2619,10 +2625,30 @@ async def _run_voice_locked(device: Device, trigger_label: str = "unknown",
                     # cancelled and that stays cancelled — the user spoke over
                     # this device and it must stop talking regardless of who
                     # answers. What it must NOT do is run the turn as well.
+                    wake_info = device.last_wake
+                    no_ha     = device.barge_no_ha
                     device.barge_detected = False
                     device.barge_ceded    = False
+                    device.barge_no_ha    = False
                     device.cancel_event.clear()
                     device.last_wake = None
+                    if no_ha:
+                        # The wake path's treatment of a stand-down for no HA:
+                        # a row in the activity history and the ring cue. Done
+                        # here rather than in the watcher, because the turn it
+                        # interrupted has now recorded its own outcome and run
+                        # its ring cleanup, which would otherwise overwrite
+                        # the outcome and skip the cue while barge_detected
+                        # was still set. "barge-in" rather than "wakeword" as
+                        # the label: readers of trigger group on its prefix.
+                        # The ring is dark after cleanup; relight it as the
+                        # wake path's is at this point, so the cue's hold is
+                        # a hold and the two paths look the same.
+                        score = (wake_info or {}).get("score")
+                        label = f"barge-in({score:.3f})" if score is not None else "barge-in"
+                        await leds_listening(device)
+                        await esphome.record_dropped_wake(device, label, wake_info)
+                        await _leds_turn_end(device)
                     break
 
                 if device.barge_detected:
@@ -3027,7 +3053,10 @@ async def _private_barge(device: Device, ev: dict) -> None:
             device.device_id, device.wake_arb_ms / 1000.0,
             heard_at=_wake_heard_at(device, ev), slack_s=_arbitration_slack(),
         )
-    device.barge_ceded = (not serves) or won_by != device.device_id
+    reason = em_barge.stand_down_reason(
+        serves=serves, won_by=won_by, device_id=device.device_id)
+    device.barge_ceded = reason is not None
+    device.barge_no_ha = reason == "no_ha"
     if device.barge_ceded:
         await device.listen_close(session, "ceded")
         log.info(f"[{device.device_id}] Barge-in ceded to "
