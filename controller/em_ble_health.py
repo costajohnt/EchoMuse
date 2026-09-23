@@ -73,3 +73,18 @@ def observe(
         f"check the device log for the read error, and for mic or link "
         f"trouble in the same window",
     )
+
+
+def device_restarted(prev_seen: int, seen: int) -> bool:
+    """
+    True when the device's `advertsSeen` counter went backwards.
+
+    `advertsSeen` counts from the device process's start (a reboot or a
+    service restart), while the controller's forwarded/received counters
+    live on a proxy object that survives every reconnect, so the Status tab
+    showed "Forwarded to HA" several times "Adverts seen" (#410). The caller
+    zeroes its own counters on a rebase so both columns share the device's
+    clock. A reconnect without a restart keeps `advertsSeen`, so it
+    deliberately does not count as one.
+    """
+    return max(0, int(seen or 0)) < max(0, int(prev_seen or 0))

@@ -85,6 +85,30 @@ def test_missing_counters_are_treated_as_zero_not_as_a_crash():
     assert (obs.restarts, obs.errors) == (0, 0)
 
 
+def test_adverts_seen_going_backwards_means_the_device_restarted():
+    """
+    advertsSeen counts from the device process's start, so a lower value is a
+    restart and the controller's forwarded count has to start over with it
+    (#410).
+    """
+    assert health.device_restarted(36_430, 12)
+
+
+def test_a_rising_or_steady_adverts_seen_is_not_a_restart():
+    """A reconnect without a reboot keeps the device's count running."""
+    assert not health.device_restarted(100, 150)
+    assert not health.device_restarted(100, 100)
+
+
+def test_the_first_report_after_controller_start_is_not_a_restart():
+    """The proxy starts at 0, so the device's first total is a rise."""
+    assert not health.device_restarted(0, 36_430)
+
+
+def test_a_missing_adverts_seen_is_not_a_restart_from_zero():
+    assert not health.device_restarted(0, None)
+
+
 # ── The wiring, asserted on source ───────────────────────────────────────────
 #
 # em_ble_proxy cannot be imported here (zeroconf), so the two facts that make
@@ -95,6 +119,8 @@ def test_the_proxy_routes_its_counters_through_this_module():
     assert "import em_ble_health" in src
     assert re.search(r"em_ble_health\.observe\(", src), \
         "update_stats must use the shared decision, not its own copy"
+    assert re.search(r"em_ble_health\.device_restarted\(", src), \
+        "update_stats must rebase the forwarded count with the device (#410)"
 
 
 def test_the_status_payload_surfaces_the_counters():

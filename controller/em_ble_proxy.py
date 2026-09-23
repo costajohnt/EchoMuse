@@ -420,7 +420,14 @@ def update_stats(device_id: str, ble_stats: dict) -> None:
     proxy = _proxies.get(device_id)
     if proxy is None or not isinstance(ble_stats, dict):
         return
-    proxy.adverts_seen = int(ble_stats.get("advertsSeen") or 0)
+    seen = int(ble_stats.get("advertsSeen") or 0)
+    # Zero the controller-side counters when the device's counter rebases, so
+    # the Status tab compares adverts seen and forwarded over the same span
+    # (#410). See em_ble_health.device_restarted.
+    if em_ble_health.device_restarted(proxy.adverts_seen, seen):
+        proxy.adverts_received = 0
+        proxy.adverts_forwarded = 0
+    proxy.adverts_seen = seen
 
     # Transport resets. Worth a warning of their own because /dev/stpbt is
     # NOT a Bluetooth-only device: it is the MT8163's combo radio behind
